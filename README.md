@@ -1,3 +1,4 @@
+https://upi-pulse-analyst-pnnj8sbma3nu4dfznhghy5.streamlit.app/
 # 📊 UPI Pulse Analyst
 
 **Short description:** An analytics dashboard on PhonePe's open Pulse data (36 states/UTs, 780 districts, 2018 to Q2 2026) covering digital payment growth, category mix, user engagement, and district-level anomaly screening. Built with Python, pandas, scikit-learn and Streamlit, and containerised with Docker. A natural-language (text-to-SQL) layer is in progress.
