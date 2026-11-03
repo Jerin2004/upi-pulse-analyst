@@ -1,6 +1,6 @@
 # 📊 UPI Pulse Analyst
 
-**Live demo:** _add your Streamlit link here_
+**Live demo:** https://upi-pulse-analyst-pnnj8sbma3nu4dfznhghy5.streamlit.app/
 
 **Short description:** An analytics app on PhonePe's open Pulse data (36 states/UTs, 780 districts, Q1 2018 to Q2 2026). It combines SQL analytics (window functions, CTEs, joins on a SQLite warehouse), seasonality-aware anomaly screening, a Streamlit dashboard, and a guarded natural-language-to-SQL assistant (Groq / Llama 3.3). Python, pandas, SQLite, scikit-learn, Streamlit, Docker, GitHub Actions.
 
