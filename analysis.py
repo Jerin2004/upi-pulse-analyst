@@ -1,7 +1,6 @@
 """Analysis helpers: growth, mix shift, ticket size, and district-level anomaly detection."""
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import IsolationForest
 
 def national_trend(sc):
     return sc.groupby(["year", "quarter", "period", "category"], as_index=False).txn_count.sum()
@@ -21,21 +20,17 @@ def txns_per_user(sc, u, period):
     us = u[u.period == period].set_index("state").registered_users
     return (tx / us).rename("txns_per_registered_user").reset_index()
 
-def district_anomalies(d, period, contamination=0.01, seed=42):
-    """Flag districts whose quarter looks unusual vs. their own history and peers.
+def seasonal_anomalies(df, period, z_threshold=3.5):
+    """Rank districts by how far their QoQ growth deviates from their OWN seasonal norm.
 
-    Features: QoQ count growth, QoQ amount growth, ticket-size z-score within state.
-    Unsupervised (Isolation Forest) - a screening tool, not a fraud verdict.
+    `df` is the output of sql/seasonal_anomaly.sql (qoq vs average QoQ of the same quarter in the prior 3 years).
+    The excess is standardised with a robust z-score (median / MAD) within the quarter, which removes the
+    market-wide slowdown effect and is not distorted by the outliers we are trying to find.
     """
-    d = d.sort_values(["state", "district", "year", "quarter"]).copy()
-    g = d.groupby(["state", "district"])
-    d["count_qoq"] = g.txn_count.pct_change()
-    d["amount_qoq"] = g.txn_amount.pct_change()
-    d["ticket"] = d.txn_amount / d.txn_count
-    d["ticket_z"] = d.groupby(["state", "period"]).ticket.transform(lambda s: (s - s.mean()) / (s.std() + 1e-9))
-    cur = d[(d.period == period) & (d.txn_count > 1_000_000)].dropna(subset=["count_qoq", "amount_qoq", "ticket_z"]).copy()
-    feats = cur[["count_qoq", "amount_qoq", "ticket_z"]].replace([np.inf, -np.inf], np.nan).fillna(0)
-    model = IsolationForest(contamination=contamination, random_state=seed).fit(feats)
-    cur["anomaly_score"] = -model.score_samples(feats)
-    cur["flagged"] = model.predict(feats) == -1
-    return cur.sort_values("anomaly_score", ascending=False)
+    cur = df[df.period == period].copy()
+    med = cur.excess_qoq.median()
+    mad = (cur.excess_qoq - med).abs().median() * 1.4826
+    cur["robust_z"] = (cur.excess_qoq - med) / (mad + 1e-9)
+    cur["flagged"] = cur.robust_z.abs() >= z_threshold
+    cur["direction"] = cur.robust_z.apply(lambda z: "above seasonal norm" if z > 0 else "below seasonal norm")
+    return cur.reindex(cur.robust_z.abs().sort_values(ascending=False).index)
