@@ -30,61 +30,110 @@ from sql.queries import QUERIES
 from sql_ai import UnsafeSQL, answer, run_sql
 
 
-# --------------------------------------------------
+# ==================================================
 # PAGE CONFIGURATION
-# --------------------------------------------------
+# ==================================================
 
 st.set_page_config(
     page_title="UPI Pulse Analyst",
     page_icon="📊",
-    layout="wide"
+    layout="wide",
 )
 
 DATA_ROOT = os.environ.get("PULSE_PATH", "pulse")
 
-if not pathlib.Path(DATA_ROOT).exists():
-    subprocess.run(
-        [
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            "https://github.com/PhonePe/pulse.git",
-            DATA_ROOT,
-        ],
-        check=True,
+
+# ==================================================
+# DATASET DOWNLOAD
+# ==================================================
+
+
+import shutil
+import tempfile
+
+def ensure_data():
+
+    data_path = pathlib.Path(DATA_ROOT)
+
+    expected_path = (
+        data_path
+        / "data/aggregated/transaction/country/india/state"
     )
 
+    # Check whether actual dataset files exist
+    existing_files = (
+        list(expected_path.glob("*/*/*.json"))
+        if expected_path.exists()
+        else []
+    )
 
-# --------------------------------------------------
-# DATA LOADING
-# --------------------------------------------------
+    if existing_files:
+        return
 
-@st.cache_data(show_spinner="Loading PhonePe Pulse data...")
-def load():
+    st.info("PhonePe Pulse dataset missing. Downloading...")
 
-    sc = add_period(load_state_category(DATA_ROOT))
-    d = add_period(load_district(DATA_ROOT))
-    u = add_period(load_users(DATA_ROOT))
+    # Clone into a temporary directory first
+    temp_path = pathlib.Path(
+        tempfile.mkdtemp()
+    ) / "pulse"
 
-    # Normalize period values
-    sc["period"] = sc["period"].astype(str)
-    d["period"] = d["period"].astype(str)
-    u["period"] = u["period"].astype(str)
+    try:
 
-    return sc, d, u
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "https://github.com/PhonePe/pulse.git",
+                str(temp_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
+        if not (
+            temp_path
+            / "data/aggregated/transaction/country/india/state"
+        ).exists():
+            raise RuntimeError(
+                "Cloned repository does not contain expected data."
+            )
+
+        # Replace incomplete dataset directory
+        if data_path.exists():
+            shutil.rmtree(data_path)
+
+        shutil.copytree(temp_path, data_path)
+
+    except Exception as e:
+
+        raise RuntimeError(
+            f"Unable to download PhonePe Pulse dataset: {e}"
+        ) from e
+
+
+
+# ==================================================
+# DATABASE
+# ==================================================
 
 @st.cache_resource(show_spinner="Building SQL database...")
 def get_db():
 
     path = pathlib.Path(tempfile.gettempdir()) / "pulse_analyst.db"
 
+    # Build database if it does not exist
     if not path.exists():
         build_db(DATA_ROOT, path)
 
     return str(path)
 
+
+# ==================================================
+# GROQ API KEY
+# ==================================================
 
 def groq_key():
 
@@ -94,65 +143,20 @@ def groq_key():
         return os.environ.get("GROQ_API_KEY")
 
 
-# --------------------------------------------------
-# INITIALIZE DATA
-# --------------------------------------------------
-
-sc, d, u = load()
-
-DB = get_db()
-
-
-# --------------------------------------------------
-# QUARTER SELECTION
-# --------------------------------------------------
-
-periods = sorted(
-    sc["period"].dropna().astype(str).unique()
-)
-
-if not periods:
-    st.error("No quarterly data found.")
-    st.stop()
-
-latest = st.sidebar.selectbox(
-    "Quarter",
-    periods[::-1],
-    index=0,
-)
-
-# Calculate equivalent quarter from previous year
-try:
-    year = int(latest[:4])
-    quarter = latest[4:]
-
-    prior = f"{year - 1}{quarter}"
-
-except (ValueError, TypeError, IndexError):
-    prior = None
-
-
-# Check historical data availability separately
-has_prior_sc = (
-    prior is not None and prior in set(sc["period"])
-)
-
-has_prior_d = (
-    prior is not None and prior in set(d["period"])
-)
-
-has_prior = has_prior_sc and has_prior_d
-
-
-# --------------------------------------------------
+# ==================================================
 # HELPER FUNCTIONS
-# --------------------------------------------------
+# ==================================================
 
 def clean(series):
-    return series.str.replace("-", " ").str.title()
+
+    return (
+        series.astype(str)
+        .str.replace("-", " ", regex=False)
+        .str.title()
+    )
 
 
-def safe_growth(current, previous):
+def calculate_growth(current, previous):
 
     if pd.isna(previous) or previous == 0:
         return None
@@ -160,28 +164,153 @@ def safe_growth(current, previous):
     return f"{current / previous - 1:+.1%} YoY"
 
 
-# --------------------------------------------------
-# AGGREGATIONS
-# --------------------------------------------------
+def calculate_prior(latest):
 
-tot = sc.groupby("period").txn_count.sum()
-amt = d.groupby("period").txn_amount.sum()
+    try:
+        year = int(latest[:4])
+        quarter = latest[4:]
 
-if latest not in tot.index or latest not in amt.index:
-    st.error(f"Missing transaction data for {latest}.")
+        return f"{year - 1}{quarter}"
+
+    except (ValueError, TypeError, IndexError):
+        return None
+
+
+# ==================================================
+# INITIALIZE APPLICATION
+# ==================================================
+
+try:
+
+    sc, d, u = load()
+
+except Exception as e:
+
+    st.error("Unable to load PhonePe Pulse data.")
+
+    st.exception(e)
+
+    st.info(
+        "Check load_data.py, the dataset directory, "
+        "and the Streamlit Cloud logs."
+    )
+
     st.stop()
+
+
+# ==================================================
+# VALIDATE DATA
+# ==================================================
+
+required_columns = {
+    "state_category": ["period", "state", "txn_count"],
+    "district": ["period", "state", "district", "txn_amount"],
+    "users": ["period"],
+}
+
+for name, frame, required in [
+    ("State category", sc, required_columns["state_category"]),
+    ("District", d, required_columns["district"]),
+    ("Users", u, required_columns["users"]),
+]:
+
+    missing = [
+        col for col in required
+        if col not in frame.columns
+    ]
+
+    if missing:
+
+        st.error(
+            f"{name} dataset is missing columns: {missing}"
+        )
+
+        st.write("Available columns:", frame.columns.tolist())
+
+        st.stop()
+
+
+# ==================================================
+# QUARTER SELECTION
+# ==================================================
+
+periods = sorted(
+    sc["period"].dropna().astype(str).unique()
+)
+
+if not periods:
+
+    st.error(
+        "No quarterly data found in the state-category dataset."
+    )
+
+    st.write("Dataset shape:", sc.shape)
+    st.write("Columns:", sc.columns.tolist())
+    st.dataframe(sc.head(10))
+
+    st.stop()
+
+
+latest = st.sidebar.selectbox(
+    "Quarter",
+    periods[::-1],
+    index=0,
+)
+
+prior = calculate_prior(latest)
+
+sc_periods = set(sc["period"].astype(str))
+d_periods = set(d["period"].astype(str))
+
+has_prior_sc = prior in sc_periods if prior else False
+has_prior_d = prior in d_periods if prior else False
+
+
+# ==================================================
+# DATABASE INITIALIZATION
+# ==================================================
+
+try:
+
+    DB = get_db()
+
+except Exception as e:
+
+    st.error("Unable to initialize SQL database.")
+    st.exception(e)
+    st.stop()
+
+
+# ==================================================
+# AGGREGATIONS
+# ==================================================
+
+tot = sc.groupby("period")["txn_count"].sum()
+amt = d.groupby("period")["txn_amount"].sum()
+
+if latest not in tot.index:
+
+    st.error(f"No transaction count available for {latest}.")
+    st.stop()
+
+if latest not in amt.index:
+
+    st.error(f"No transaction amount available for {latest}.")
+    st.stop()
+
 
 latest_txns = tot[latest]
 latest_amt = amt[latest]
 
 if latest_txns == 0:
-    st.error("Transaction count is zero for the selected quarter.")
+
+    st.error("Transaction count is zero.")
     st.stop()
 
 
-# --------------------------------------------------
-# DASHBOARD HEADER
-# --------------------------------------------------
+# ==================================================
+# HEADER
+# ==================================================
 
 st.title("📊 UPI Pulse Analyst")
 
@@ -191,22 +320,29 @@ st.caption(
 )
 
 
-# --------------------------------------------------
-# KEY METRICS
-# --------------------------------------------------
+# ==================================================
+# METRICS
+# ==================================================
 
 c1, c2, c3, c4 = st.columns(4)
 
-if has_prior and prior in tot.index and prior in amt.index:
+has_prior = (
+    has_prior_sc
+    and has_prior_d
+    and prior in tot.index
+    and prior in amt.index
+)
 
-    txn_growth = safe_growth(
+if has_prior:
+
+    txn_growth = calculate_growth(
         latest_txns,
-        tot[prior]
+        tot[prior],
     )
 
-    value_growth = safe_growth(
+    value_growth = calculate_growth(
         latest_amt,
-        amt[prior]
+        amt[prior],
     )
 
     previous_ticket = (
@@ -228,38 +364,37 @@ else:
     ticket_growth = None
 
     st.sidebar.warning(
-        f"Previous-year data ({prior}) is unavailable. "
-        "YoY comparisons are disabled."
+        f"Previous-year data ({prior}) is unavailable."
     )
 
 
 c1.metric(
     "Transactions (qtr)",
     f"{latest_txns / 1e9:.1f} B",
-    txn_growth
+    txn_growth,
 )
 
 c2.metric(
     "Value (qtr)",
     f"₹{latest_amt / 1e12:.1f} L Cr",
-    value_growth
+    value_growth,
 )
 
 c3.metric(
     "Avg ticket",
     f"₹{latest_amt / latest_txns:,.0f}",
-    ticket_growth
+    ticket_growth,
 )
 
 c4.metric(
     "States / UTs",
-    sc.state.nunique()
+    sc["state"].nunique(),
 )
 
 
-# --------------------------------------------------
-# DASHBOARD TABS
-# --------------------------------------------------
+# ==================================================
+# TABS
+# ==================================================
 
 t1, t2, t3, t4, t5 = st.tabs(
     [
@@ -273,7 +408,7 @@ t1, t2, t3, t4, t5 = st.tabs(
 
 
 # ==================================================
-# TAB 1: NATIONAL TRENDS
+# TAB 1: TRENDS
 # ==================================================
 
 with t1:
@@ -301,7 +436,7 @@ with t1:
         mix.sum(axis=1),
         axis=0,
     ).reset_index().melt(
-        "period",
+        id_vars="period",
         value_name="share",
     )
 
@@ -311,17 +446,19 @@ with t1:
             x="period",
             y="share",
             color="category",
-            title=(
-                "Category mix: Utility/P2P surged in 2020-21, "
-                "Retail has gained share every year since"
-            ),
+            title="Quarterly transaction category mix",
         ),
         width="stretch",
     )
 
+    common_periods = tot.index.intersection(amt.index)
+
     tk = pd.DataFrame({
-        "period": amt.index,
-        "avg_ticket_inr": (amt / tot.reindex(amt.index)).values,
+        "period": common_periods,
+        "avg_ticket_inr": (
+            amt.loc[common_periods] /
+            tot.loc[common_periods]
+        ).values,
     })
 
     st.plotly_chart(
@@ -329,10 +466,7 @@ with t1:
             tk,
             x="period",
             y="avg_ticket_inr",
-            title=(
-                "Average ticket size (₹) "
-                "has fallen every year since its 2021 peak"
-            ),
+            title="Average ticket size (₹)",
         ),
         width="stretch",
     )
@@ -346,12 +480,11 @@ with t2:
 
     a, b = st.columns(2)
 
-    # State growth chart requires previous-year data
     if has_prior_sc:
 
         g = state_growth(sc, latest, prior)
 
-        g["state"] = clean(g.state)
+        g["state"] = clean(g["state"])
 
         a.plotly_chart(
             px.bar(
@@ -367,14 +500,12 @@ with t2:
     else:
 
         a.warning(
-            f"Previous-year state data ({prior}) is unavailable. "
-            "State growth cannot be calculated."
+            "Previous-year state data unavailable."
         )
 
-    # Ticket size
     tkt = ticket_size(d, latest)
 
-    tkt["state"] = clean(tkt.state)
+    tkt["state"] = clean(tkt["state"])
 
     b.plotly_chart(
         px.bar(
@@ -390,23 +521,24 @@ with t2:
         width="stretch",
     )
 
-    # Transactions per registered user
-    tu = txns_per_user(sc, u, latest)
+    if not u.empty:
 
-    tu["state"] = clean(tu.state)
+        tu = txns_per_user(sc, u, latest)
 
-    st.plotly_chart(
-        px.bar(
-            tu.sort_values(
-                "txns_per_registered_user",
-                ascending=False,
+        tu["state"] = clean(tu["state"])
+
+        st.plotly_chart(
+            px.bar(
+                tu.sort_values(
+                    "txns_per_registered_user",
+                    ascending=False,
+                ),
+                x="state",
+                y="txns_per_registered_user",
+                title="Transactions per registered user",
             ),
-            x="state",
-            y="txns_per_registered_user",
-            title="Transactions per registered user (engagement depth)",
-        ),
-        width="stretch",
-    )
+            width="stretch",
+        )
 
 
 # ==================================================
@@ -417,12 +549,9 @@ with t3:
 
     st.markdown(
         "**Seasonally adjusted anomaly screening.** "
-        "Each district's quarter-on-quarter growth is compared with "
-        "its own average for the same quarter in the previous 3 years "
-        "(SQL window functions), then standardised with a robust "
-        "z-score (median/MAD) across districts. A flag means "
-        "*behaving unlike its usual seasonal pattern* and is a "
-        "reason to investigate, not evidence of fraud."
+        "Each district's quarterly growth is compared with "
+        "its historical seasonal pattern. A flag is a reason "
+        "to investigate, not evidence of fraud."
     )
 
     z_thr = st.slider(
@@ -433,92 +562,105 @@ with t3:
         0.5,
     )
 
-    seas = pd.read_sql(
-        pathlib.Path("sql/seasonal_anomaly.sql").read_text(),
-        sqlite3.connect(DB),
-    )
+    anomaly_file = pathlib.Path("sql/seasonal_anomaly.sql")
 
-    an = seasonal_anomalies(
-        seas,
-        latest,
-        z_thr,
-    )
+    if not anomaly_file.exists():
 
-    if an.empty:
-
-        st.warning(
-            "Not enough history for this quarter "
-            "(needs 3 prior years of the same quarter)."
-        )
+        st.error("sql/seasonal_anomaly.sql not found.")
 
     else:
 
-        top = an.head(10).copy()
+        try:
 
-        top["state"] = clean(top.state)
-        top["district"] = top.district.str.title()
+            with sqlite3.connect(DB) as conn:
 
-        st.dataframe(
-            top[
-                [
-                    "state",
-                    "district",
-                    "txn_count",
-                    "qoq",
-                    "seasonal_qoq",
-                    "robust_z",
-                    "direction",
-                    "flagged",
+                seas = pd.read_sql(
+                    anomaly_file.read_text(),
+                    conn,
+                )
+
+            an = seasonal_anomalies(
+                seas,
+                latest,
+                z_thr,
+            )
+
+            if an.empty:
+
+                st.warning(
+                    "Not enough historical data for this quarter."
+                )
+
+            else:
+
+                top = an.head(10).copy()
+
+                top["state"] = clean(top["state"])
+                top["district"] = top["district"].str.title()
+
+                st.dataframe(
+                    top[
+                        [
+                            "state",
+                            "district",
+                            "txn_count",
+                            "qoq",
+                            "seasonal_qoq",
+                            "robust_z",
+                            "direction",
+                            "flagged",
+                        ]
+                    ].style.format(
+                        {
+                            "txn_count": "{:,.0f}",
+                            "qoq": "{:+.0%}",
+                            "seasonal_qoq": "{:+.0%}",
+                            "robust_z": "{:.1f}",
+                        }
+                    ),
+                    width="stretch",
+                )
+
+                st.caption(
+                    f"{int(an.flagged.sum())} of {len(an)} "
+                    f"districts flagged in {latest}."
+                )
+
+                opts = [
+                    f"{r.district.title()} "
+                    f"({r.state.replace('-', ' ').title()})"
+                    for r in an.head(10).itertuples()
                 ]
-            ].style.format(
-                {
-                    "txn_count": "{:,.0f}",
-                    "qoq": "{:+.0%}",
-                    "seasonal_qoq": "{:+.0%}",
-                    "robust_z": "{:.1f}",
-                }
-            ),
-            width="stretch",
-        )
 
-        st.caption(
-            f"{int(an.flagged.sum())} of {len(an)} "
-            f"districts flagged in {latest}."
-        )
+                pick = st.selectbox(
+                    "Inspect a district's history",
+                    opts,
+                )
 
-        opts = [
-            f"{r.district.title()} "
-            f"({r.state.replace('-', ' ').title()})"
-            for r in an.head(10).itertuples()
-        ]
+                row = an.iloc[opts.index(pick)]
 
-        pick = st.selectbox(
-            "Inspect a district's history",
-            opts,
-        )
+                hist = d[
+                    (d["state"] == row.state)
+                    & (d["district"] == row.district)
+                ].sort_values(
+                    ["year", "quarter"]
+                )
 
-        row = an.iloc[opts.index(pick)]
+                st.plotly_chart(
+                    px.line(
+                        hist,
+                        x="period",
+                        y="txn_count",
+                        markers=True,
+                        title=f"{pick}: quarterly transactions",
+                    ),
+                    width="stretch",
+                )
 
-        hist = d[
-            (d.state == row.state)
-            & (d.district == row.district)
-        ].sort_values(
-            ["year", "quarter"]
-        )
+        except Exception as e:
 
-        st.plotly_chart(
-            px.line(
-                hist,
-                x="period",
-                y="txn_count",
-                markers=True,
-                title=(
-                    f"{pick}: quarterly transactions "
-                    "(look for a repeating seasonal peak)"
-                ),
-            ),
-            width="stretch",
-        )
+            st.error("Anomaly analysis failed.")
+            st.exception(e)
 
 
 # ==================================================
@@ -528,9 +670,8 @@ with t3:
 with t4:
 
     st.markdown(
-        "Curated analytical queries (SQLite): window functions, "
-        "CTEs and joins on the same data. "
-        "Pick one, read the SQL, see the result."
+        "Curated analytical queries using SQLite, "
+        "window functions, CTEs and joins."
     )
 
     key = st.selectbox(
@@ -550,15 +691,22 @@ with t4:
         language="sql",
     )
 
-    res = run_sql(
-        DB,
-        q["sql"],
-    )
+    try:
 
-    st.dataframe(
-        res,
-        width="stretch",
-    )
+        res = run_sql(
+            DB,
+            q["sql"],
+        )
+
+        st.dataframe(
+            res,
+            width="stretch",
+        )
+
+    except Exception as e:
+
+        st.error("SQL query failed.")
+        st.exception(e)
 
 
 # ==================================================
@@ -568,10 +716,9 @@ with t4:
 with t5:
 
     st.markdown(
-        "Ask a question in plain English. An LLM (Groq / Llama 3.3) "
-        "writes the SQL; it is validated, run on a **read-only** "
-        "connection with an authorizer and a time limit, "
-        "and shown to you so you can check it."
+        "Ask a question in plain English. Groq / Llama 3.3 "
+        "generates SQL, which is validated and executed "
+        "on a read-only database connection."
     )
 
     examples = [
@@ -592,109 +739,135 @@ with t5:
 
     if st.button(
         "Run",
-        disabled=not question,
+        disabled=not question.strip(),
     ):
 
-        if not groq_key():
+        key_value = groq_key()
+
+        if not key_value:
 
             st.info(
-                "Add a GROQ_API_KEY (Streamlit secrets or environment "
-                "variable) to enable this. You can still write SQL "
-                "yourself below."
+                "Add GROQ_API_KEY in Streamlit secrets "
+                "or environment variables to enable AI SQL."
             )
 
         else:
 
-            with st.spinner("Thinking..."):
+            try:
 
-                out = answer(
-                    question,
-                    DB,
-                    api_key=groq_key(),
-                )
+                with st.spinner("Thinking..."):
 
-            if out["error"]:
-                st.error(out["error"])
+                    out = answer(
+                        question,
+                        DB,
+                        api_key=key_value,
+                    )
 
-            if out["explanation"]:
-                st.markdown(out["explanation"])
+                if out["error"]:
+                    st.error(out["error"])
 
-            if out["sql"]:
-                st.code(
-                    out["sql"],
-                    language="sql",
-                )
+                if out["explanation"]:
+                    st.markdown(out["explanation"])
 
-            if out["df"] is not None:
+                if out["sql"]:
+                    st.code(
+                        out["sql"],
+                        language="sql",
+                    )
 
-                st.dataframe(
-                    out["df"],
-                    width="stretch",
-                )
+                if out["df"] is not None:
 
-                num = out["df"].select_dtypes(
-                    "number"
-                ).columns
-
-                if (
-                    2 <= len(out["df"].columns)
-                    and len(num) >= 1
-                    and 1 < len(out["df"]) <= 60
-                ):
-
-                    x = [
-                        c
-                        for c in out["df"].columns
-                        if c not in num[:1]
-                    ][0]
-
-                    st.plotly_chart(
-                        px.bar(
-                            out["df"],
-                            x=x,
-                            y=num[0],
-                        ),
+                    st.dataframe(
+                        out["df"],
                         width="stretch",
                     )
 
-    # SQL CONSOLE
-    with st.expander("SQL console (write your own SELECT)"):
+                    num = out["df"].select_dtypes(
+                        include="number"
+                    ).columns
 
-        schema = pd.read_sql(
-            "SELECT name FROM sqlite_master WHERE type='table'",
-            sqlite3.connect(DB),
-        )
+                    if (
+                        len(out["df"]) > 1
+                        and len(out["df"]) <= 60
+                        and len(out["df"].columns) >= 2
+                        and len(num) >= 1
+                    ):
 
-        st.caption(
-            "Tables: "
-            + ", ".join(schema.name)
-            + ". Only SELECT/WITH is allowed."
-        )
+                        x = next(
+                            (
+                                col for col in out["df"].columns
+                                if col not in num
+                            ),
+                            None,
+                        )
 
-        mine = st.text_area(
-            "SQL",
-            "SELECT state, SUM(txn_count) AS txns\n"
-            "FROM state_category\n"
-            "WHERE period = '2026-Q2'\n"
-            "GROUP BY state\n"
-            "ORDER BY txns DESC\n"
-            "LIMIT 10",
-            height=140,
-        )
+                        if x:
 
-        if st.button("Run my SQL"):
-
-            try:
-
-                st.dataframe(
-                    run_sql(DB, mine),
-                    width="stretch",
-                )
-
-            except UnsafeSQL as e:
-
-                st.error(f"Blocked: {e}")
+                            st.plotly_chart(
+                                px.bar(
+                                    out["df"],
+                                    x=x,
+                                    y=num[0],
+                                ),
+                                width="stretch",
+                            )
 
             except Exception as e:
 
-                st.error(f"SQL error: {e}")
+                st.error("AI SQL execution failed.")
+                st.exception(e)
+
+
+    # --------------------------------------------------
+    # CUSTOM SQL CONSOLE
+    # --------------------------------------------------
+
+    with st.expander("SQL console (write your own SELECT)"):
+
+        try:
+
+            with sqlite3.connect(DB) as conn:
+
+                schema = pd.read_sql(
+                    "SELECT name FROM sqlite_master WHERE type='table'",
+                    conn,
+                )
+
+            st.caption(
+                "Tables: "
+                + ", ".join(schema["name"])
+                + ". Only SELECT/WITH is allowed."
+            )
+
+            mine = st.text_area(
+                "SQL",
+                "SELECT state, SUM(txn_count) AS txns\n"
+                "FROM state_category\n"
+                "WHERE period = '2026-Q2'\n"
+                "GROUP BY state\n"
+                "ORDER BY txns DESC\n"
+                "LIMIT 10",
+                height=140,
+            )
+
+            if st.button("Run my SQL"):
+
+                try:
+
+                    st.dataframe(
+                        run_sql(DB, mine),
+                        width="stretch",
+                    )
+
+                except UnsafeSQL as e:
+
+                    st.error(f"Blocked: {e}")
+
+                except Exception as e:
+
+                    st.error(f"SQL error: {e}")
+
+        except Exception as e:
+
+            st.error("Unable to load SQL schema.")
+            st.exception(e)
